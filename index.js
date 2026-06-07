@@ -14,6 +14,16 @@
 process.env.PUPPETEER_SKIP_DOWNLOAD = 'true';
 process.env.PUPPETEER_SKIP_CHROMIUM_DOWNLOAD = 'true';
 
+// ---------- Global crash guards (keeps bot alive on unexpected errors) ----------
+process.on('uncaughtException', (err) => {
+  try { console.error('[uncaughtException]', err?.stack || err?.message || err); } catch {}
+});
+process.on('unhandledRejection', (reason) => {
+  try { console.error('[unhandledRejection]', reason?.stack || reason?.message || reason); } catch {}
+});
+process.on('SIGTERM', () => { console.log('[SIGTERM] graceful shutdown'); setTimeout(() => process.exit(0), 1500); });
+process.on('SIGINT',  () => { console.log('[SIGINT] graceful shutdown');  setTimeout(() => process.exit(0), 1500); });
+
 const { initializeTempSystem } = require('./utils/tempManager');
 const { startCleanup } = require('./utils/cleanup');
 try { initializeTempSystem(); } catch (e) { console.warn('tempSystem init failed:', e.message); }
