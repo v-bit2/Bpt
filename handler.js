@@ -68,7 +68,54 @@ function buildStyledReply(sock, from, msg, sender, title) {
 const groupMetadataCache = new Map();
 const CACHE_TTL = 60000; // 1 minute cache
 
-// Load all commands
+// ---------- Abuse prevention ----------
+// Per-user sliding-window flood guard + per-(user,command) cooldown.
+// Heavy commands get longer cooldowns to protect API quotas and RAM.
+const RATE_WINDOW_MS = 60_000;   // 1 minute
+const RATE_MAX       = 25;       // max commands per user per minute
+const DEFAULT_COOLDOWN_MS = 2_000;
+const HEAVY_COOLDOWN_MS   = 10_000;
+const HEAVY_COMMANDS = new Set([
+  'song','video','play','ytmp3','ytmp4','tiktok','facebook','instagram','igs','igsc',
+  'ai','gptimage','magicstudio','sticker','take','attp','ttp','tts','meme','memesearch',
+  'pinterest','ssweb','translate','lyrics','broadcast'
+]);
+const _userBuckets = new Map();  // sender -> { times: number[] }
+const _cooldowns   = new Map();  // `${sender}|${cmd}` -> timestamp
+
+function checkRateLimit(sender, commandName) {
+  const now = Date.now();
+  // sliding-window flood
+  const bucket = _userBuckets.get(sender) || { times: [] };
+  bucket.times = bucket.times.filter(t => now - t < RATE_WINDOW_MS);
+  if (bucket.times.length >= RATE_MAX) {
+    _userBuckets.set(sender, bucket);
+    return { ok: false, reason: 'flood', count: bucket.times.length };
+  }
+  // per-command cooldown
+  const key = `${sender}|${commandName}`;
+  const last = _cooldowns.get(key) || 0;
+  const cd = HEAVY_COMMANDS.has(commandName) ? HEAVY_COOLDOWN_MS : DEFAULT_COOLDOWN_MS;
+  if (now - last < cd) {
+    return { ok: false, reason: 'cooldown', wait: Math.ceil((cd - (now - last)) / 1000) };
+  }
+  bucket.times.push(now);
+  _userBuckets.set(sender, bucket);
+  _cooldowns.set(key, now);
+  return { ok: true };
+}
+
+// Periodic GC to prevent memory growth
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of _userBuckets) {
+    v.times = v.times.filter(t => now - t < RATE_WINDOW_MS);
+    if (!v.times.length) _userBuckets.delete(k);
+  }
+  for (const [k, t] of _cooldowns) {
+    if (now - t > 5 * 60_000) _cooldowns.delete(k);
+  }
+}, 60_000).unref?.();
 const commands = loadCommands();
 
 // ---------- Per-command reaction emojis ----------
@@ -915,11 +962,27 @@ const handleMessage = async (sock, msg) => {
     // Get command
     const command = commands.get(commandName);
     if (!command) return;
-    
+
+    // ---------- Abuse prevention: per-user rate-limit + per-command cooldown ----------
+    if (!isOwner(sock, sender)) {
+      const rl = checkRateLimit(sender, commandName);
+      if (!rl.ok) {
+        // Silently drop floods to avoid amplifying spam; only notify cooldown once.
+        if (rl.reason === 'cooldown') {
+          try { await sock.sendMessage(from, { text: `⏳ Slow down — wait ${rl.wait}s before using *${commandName}* again.` }, { quoted: msg }); } catch {}
+        } else if (rl.reason === 'flood') {
+          console.warn(`[RateLimit] flood from ${sender} (${rl.count}/min) — dropping ${commandName}`);
+        }
+        return;
+      }
+    }
+
     // Check self mode (private mode) — per-account
     if (accountSettings.get(sock, 'selfMode') && !isOwner(sock, sender)) {
       return;
     }
+
+
     
     // Permission checks
     if (command.ownerOnly && !isOwner(sock, sender)) {
